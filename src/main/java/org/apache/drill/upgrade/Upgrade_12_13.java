@@ -1,8 +1,8 @@
 package org.apache.drill.upgrade;
 
-import com.sun.tools.javac.util.Pair;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.*;
+import org.apache.parquet.SemanticVersion;
 import org.apache.parquet.Version;
 import org.apache.parquet.VersionParser;
 import org.apache.parquet.bytes.BytesUtils;
@@ -22,18 +22,30 @@ import static org.apache.parquet.hadoop.ParquetFileWriter.MAGIC;
 
 public class Upgrade_12_13 {
 
-  private static String TMP_FILE_DIR = "/tmp";
   private static ParquetMetadataConverter metadataConverter = new ParquetMetadataConverter();
+  private static final org.slf4j.Logger logger = org.slf4j.LoggerFactory.getLogger(Upgrade_12_13.class);
 
   private Configuration conf = new Configuration();
   private FileSystem fs;
+  private String tmpFileDir = "/tmp";
+
+
+  private static class MetadataUpgradeInfo {
+    public ParquetMetadata metadata;
+    public String createdBy;
+
+    public MetadataUpgradeInfo(ParquetMetadata metadata, String createdBy) {
+      this.metadata = metadata;
+      this.createdBy = createdBy;
+    }
+  }
 
   private void init() throws IOException {
     Configuration conf = new Configuration();
     fs = FileSystem.get(conf);
   }
 
-  //get a list of files
+  //get a list of files to process
   private void getFiles(String path, List<FileStatus> fileStatuses) throws IOException {
     Path p = Path.getPathWithoutSchemeAndAuthority(new Path(path));
     FileStatus fileStatus = fs.getFileStatus(p);
@@ -48,7 +60,7 @@ public class Upgrade_12_13 {
     }
   }
 
-  public final Pair<ParquetMetadata, String> readFixedFooter(FileStatus file) throws IOException {
+  private final MetadataUpgradeInfo readFixedFooter(FileStatus file) throws IOException {
     FSDataInputStream f = fs.open(file.getPath());
     try {
       long l = file.getLen();
@@ -84,47 +96,39 @@ public class Upgrade_12_13 {
       fileFormatMetaData.setCreated_by(Version.FULL_VERSION);
 
       ParquetMetadata parquetMetadata = metadataConverter.fromParquetMetadata(fileFormatMetaData);
-      return new Pair<ParquetMetadata, String>(parquetMetadata, origCreatedBy);
+      return new MetadataUpgradeInfo(parquetMetadata, origCreatedBy);
     } finally {
       f.close();
     }
   }
 
-  private Pair<ParquetMetadata, String> getParquetFileMetadata(FileStatus file) throws IOException {
-    Pair<ParquetMetadata,String> metadata = readFixedFooter(file);
+  private MetadataUpgradeInfo getParquetFileMetadata(FileStatus file) throws IOException {
+    MetadataUpgradeInfo metadata = readFixedFooter(file);
     return metadata;
   }
 
   private void backupFile(FileStatus fileStatus) throws IOException {
-    FileUtil.copy(fs, fileStatus.getPath(), fs, new Path(TMP_FILE_DIR), false, true, conf);
+    FileUtil.copy(fs, fileStatus.getPath(), fs, new Path(tmpFileDir), false, true, conf);
   }
 
-  private boolean updateFile(FileStatus fileStatus, ParquetMetadata metadata /*, VersionParser.ParsedVersion version */)
-      {
-        try {
-          //FileMetaData fm = metadata.getFileMetaData();
-          //List<BlockMetaData> blocks = metadata.getBlocks();
-          //String createdBy = Version.FULL_VERSION;
-          //FileMetaData newFm = new FileMetaData(fm.getSchema(), fm.getKeyValueMetaData(), createdBy);
-          //ParquetMetadata newParquetMetadata = new ParquetMetadata(newFm, blocks);
-
-          FSDataOutputStream to;
-          //TODO: Check files created using ChecksumFileSystem after the upgrade
-          // Checksum file system does not support 'append'. We write the file without a checksum (Does this
-          // cause reads to fail ??
-          if (fs instanceof ChecksumFileSystem) {
-            to = ((ChecksumFileSystem) fs).getRawFileSystem().append(fileStatus.getPath());
-          } else {
-            to = fs.append(fileStatus.getPath());
-          }
-          serializeFooter(metadata, to);
-          to.close();
-        }catch(Exception e){
-          System.out.println("FAILURE : " + fileStatus.getPath().toString()+ ". Cause: "+ e.getMessage());
-          return false;
-        }
-
-        System.out.println("SUCCESS : " + fileStatus.getPath().toString());
+  private boolean updateFile(FileStatus fileStatus, ParquetMetadata metadata ) {
+    try {
+      FSDataOutputStream to;
+      //TODO: Check files created using ChecksumFileSystem after the upgrade
+      // Checksum file system does not support 'append'. We write the file without a checksum (Does this
+      // cause reads to fail ??
+      if (fs instanceof ChecksumFileSystem) {
+        to = ((ChecksumFileSystem) fs).getRawFileSystem().append(fileStatus.getPath());
+      } else {
+        to = fs.append(fileStatus.getPath());
+      }
+      serializeFooter(metadata, to);
+      to.close();
+    } catch (Exception e) {
+      System.out.println("FAILURE : " + fileStatus.getPath().toString() + ". Cause: " + e.getMessage());
+      return false;
+    }
+    System.out.println("SUCCESS : " + fileStatus.getPath().toString());
     return true;
   }
 
@@ -138,13 +142,12 @@ public class Upgrade_12_13 {
   }
 
   private void restoreBackupFile(FileStatus fileStatus) throws IOException {
-    FileUtil
-        .copy(fs, new Path(TMP_FILE_DIR + "/" + fileStatus.getPath().getName()), fs, fileStatus.getPath(),
-            false, true, conf);
+    FileUtil.copy(fs, new Path(tmpFileDir + "/" + fileStatus.getPath().getName()), fs, fileStatus.getPath(),
+        false, true, conf);
   }
 
   private void removeBackupFile(FileStatus fileStatus) throws IOException {
-    fs.delete(new Path(TMP_FILE_DIR + "/" + fileStatus.getPath().getName()));
+    fs.delete(new Path(tmpFileDir + "/" + fileStatus.getPath().getName()));
   }
 
   private boolean upgradeFile(FileStatus fileStatus, ParquetMetadata metadata) throws IOException {
@@ -158,32 +161,77 @@ public class Upgrade_12_13 {
     return ret;
   }
 
+
+  private static final SemanticVersion PARQUET_251_FIXED_VERSION = new SemanticVersion(1, 8, 0);
+  private static final SemanticVersion CDH_5_PARQUET_251_FIXED_START =
+      new SemanticVersion(1, 5, 0, (String) null, "cdh5.5.0", (String) null);
+  private static final SemanticVersion CDH_5_PARQUET_251_FIXED_END = new SemanticVersion(1, 5, 0);
+
+  boolean needsUpgrade(SemanticVersion semver) {
+    if (semver.compareTo(PARQUET_251_FIXED_VERSION) < 0 && (
+        semver.compareTo(CDH_5_PARQUET_251_FIXED_START) < 0
+            || semver.compareTo(CDH_5_PARQUET_251_FIXED_END) >= 0)) {
+      return true;
+    }
+    return false;
+  }
+
+  private void printUsage(){
+    System.out.println(
+        "Usage: ");
+    System.out.println(
+        "\tjava -Dlog.path=/path/to/logfile.log -cp drill-upgrade-1.0-jar-with-dependencies.jar org.apache.drill.upgrade.Upgrade_12_13 --tempDir=/path/to/tempdir list_of_dirs_or_files ");
+    System.out.println(
+        "\tjava -Dlog.path=/path/to/logfile.log -cp drill-upgrade-1.0-jar-with-dependencies.jar org.apache.drill.upgrade.Upgrade_12_13  list_of_dirs_or_files ");
+    System.out.println(
+        "\tjava -cp drill-upgrade-1.0-jar-with-dependencies.jar org.apache.drill.upgrade.Upgrade_12_13 --help ");
+    System.out.println("");
+    return;
+  }
+
   public static void main(String[] args) {
+    List<String> dirs = new ArrayList<String>();
     if (args.length >= 1) {
       Upgrade_12_13 upgrade_12_13 = new Upgrade_12_13();
       try {
         upgrade_12_13.init();
       } catch (IOException e) {
-        System.out.println("Initialization failed. (" + e.getMessage() + ")");
+        logger.info("Initialization failed. (" + e.getMessage() + ")");
       }
-      for (String path : args) {
-        System.out.println("Executing Upgrade_12_13 on " + path);
+      for (String arg : args) {
+        if (arg.startsWith("--help")) {
+          upgrade_12_13.printUsage();
+          return;
+        } else if (arg.startsWith("--tempDir")) {
+          String a[] = arg.split("=");
+          if(a.length!=2){
+            System.out.println("The option --tempDir expects a directory name.");
+            upgrade_12_13.printUsage();
+            return;
+          }
+          upgrade_12_13.tmpFileDir = a[1];
+        } else {
+          dirs.add(arg);
+        }
+      }
+      for (String path : dirs) {
+        logger.info("Executing Upgrade_12_13 on " + path);
         List<FileStatus> fileStatuses = new ArrayList<FileStatus>();
         try {
           upgrade_12_13.getFiles(path, fileStatuses);
         } catch (IOException e) {
-          System.out.println("\tFailed to get list of file(s). Skipping. (" + e.getMessage() + ")");
+          logger.error("Failed to get list of file(s). Skipping. (" + e.getMessage() + ")");
         }
         for (FileStatus fileStatus : fileStatuses) {
-          System.out.println("\tUpgrading " + fileStatus.getPath().toString());
+          logger.info("Upgrading " + fileStatus.getPath().toString());
           ParquetMetadata fixedMetadata;
           String origCreatedBy = "";
           VersionParser.ParsedVersion origVersion;
           try {
-            Pair<ParquetMetadata, String> m = upgrade_12_13.getParquetFileMetadata(fileStatus);
-            fixedMetadata=m.fst;
-            origCreatedBy=m.snd;
-            System.out.println("\t\t Created by :" + origCreatedBy);
+            MetadataUpgradeInfo m = upgrade_12_13.getParquetFileMetadata(fileStatus);
+            fixedMetadata = m.metadata;
+            origCreatedBy = m.createdBy;
+            logger.debug("Created by :" + origCreatedBy);
             try {
               origVersion = VersionParser.parse(origCreatedBy);
             } catch (VersionParser.VersionParseException v) {
@@ -191,13 +239,17 @@ public class Upgrade_12_13 {
               continue;
             }
             //TODO: Check if no semver or if hasSemver then it is older than 1.8.0
-            if (!origVersion.hasSemanticVersion() ) {
+            if (!origVersion.hasSemanticVersion() || upgrade_12_13
+                .needsUpgrade(origVersion.getSemanticVersion())) {
               upgrade_12_13.upgradeFile(fileStatus, fixedMetadata);
             } else {
-              System.out.println("SKIPPED : " + fileStatus.getPath().toString());
+              System.out.println(
+                  "SKIPPED : " + fileStatus.getPath().toString() + ". File version did not need upgrade. ["
+                      + origCreatedBy + "]");
             }
           } catch (Exception e) {
-            System.out.println("\t\t\tFile skipped. (" + e.getMessage() + ")");
+            System.out
+                .println("FAILURE : " + fileStatus.getPath().toString() + ". Cause: " + e.getMessage());
           }
         }
       }
@@ -207,6 +259,5 @@ public class Upgrade_12_13 {
     }
     return;
   }
-
 }
 
