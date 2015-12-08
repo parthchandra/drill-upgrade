@@ -46,12 +46,13 @@ public class Upgrade_12_13 {
   }
 
   //get a list of files to process
-  private void getFiles(String path, List<FileStatus> fileStatuses) throws IOException {
+  private void getFiles(String path, List<FileStatus> fileStatuses, List<FileStatus> dirs) throws IOException {
     Path p = Path.getPathWithoutSchemeAndAuthority(new Path(path));
     FileStatus fileStatus = fs.getFileStatus(p);
     if (fileStatus.isDirectory()) {
+      dirs.add(fileStatus);
       for (FileStatus f : fs.listStatus(p, new UpgradePathFilter())) {
-        getFiles(f.getPath().toString(), fileStatuses);
+        getFiles(f.getPath().toString(), fileStatuses, dirs);
       }
     } else {
       if (fileStatus.isFile()) {
@@ -150,6 +151,17 @@ public class Upgrade_12_13 {
     fs.delete(new Path(tmpFileDir + "/" + fileStatus.getPath().getName()));
   }
 
+  private void touchDirs(List<FileStatus> dirs){
+    long ts = System.currentTimeMillis();
+    for(FileStatus d : dirs){
+      try {
+        fs.setTimes(d.getPath(), ts, ts);
+      } catch (IOException e) {
+        logger.debug("Unable to update directory timestamp [ {} ].", d.toString());
+      }
+    }
+  }
+
   private boolean upgradeFile(FileStatus fileStatus, ParquetMetadata metadata) throws IOException {
     backupFile(fileStatus);
     boolean ret = updateFile(fileStatus, metadata);
@@ -217,8 +229,9 @@ public class Upgrade_12_13 {
       for (String path : dirs) {
         logger.info("Executing Upgrade_12_13 on " + path);
         List<FileStatus> fileStatuses = new ArrayList<FileStatus>();
+        List<FileStatus> dirStatuses = new ArrayList<FileStatus>();
         try {
-          upgrade_12_13.getFiles(path, fileStatuses);
+          upgrade_12_13.getFiles(path, fileStatuses, dirStatuses);
         } catch (IOException e) {
           logger.error("Failed to get list of file(s). Skipping. (" + e.getMessage() + ")");
         }
@@ -252,6 +265,8 @@ public class Upgrade_12_13 {
                 .println("FAILURE : " + fileStatus.getPath().toString() + ". Cause: " + e.getMessage());
           }
         }
+        logger.debug("Updating directory timestamps");
+        upgrade_12_13.touchDirs(dirStatuses);
       }
       System.out.println("Done");
     } else {
